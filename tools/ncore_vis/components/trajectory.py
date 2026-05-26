@@ -58,6 +58,11 @@ class TrajectoryComponent(VisualizationComponent):
         self._show_rig_frame: bool = True
         self._world_frame_handle: Optional[viser.FrameHandle] = None
         self._show_world_frame: bool = False
+        # Follow-rig state: when True, the viewport camera is translated by the
+        # same delta as the rig between consecutive frames, preserving the
+        # user's chosen orientation and standoff distance.
+        self._follow_rig: bool = False
+        self._last_rig_position: Optional[np.ndarray] = None
 
     def create_sequence_gui(self, sequence_tab: viser.GuiTabHandle) -> None:
         checkbox = self.client.gui.add_checkbox(
@@ -91,6 +96,19 @@ class TrajectoryComponent(VisualizationComponent):
             self._show_world_frame = world_frame_checkbox.value
             if self._world_frame_handle is not None:
                 self._world_frame_handle.visible = self._show_world_frame
+
+        follow_checkbox = self.client.gui.add_checkbox(
+            "Follow Rig",
+            initial_value=False,
+            hint="Translate the viewport with the rig as the sequence plays (preserves your orbit angle / zoom)",
+        )
+
+        @follow_checkbox.on_update
+        def _(_: viser.GuiEvent) -> None:
+            self._follow_rig = follow_checkbox.value
+            # Reset the anchor so the first frame after enabling doesn't jump
+            # by the full historical delta.
+            self._last_rig_position = None
 
     def populate_scene(self) -> None:
         self._world_frame_handle = self.client.scene.add_frame(
@@ -162,6 +180,22 @@ class TrajectoryComponent(VisualizationComponent):
             return
         pose = self.data_loader.get_rig_pose_at_timestamp(interval_us.end)
         self._place_rig_frame(pose)
+        self._maybe_follow(pose)
+
+    def _maybe_follow(self, pose: Optional[np.ndarray]) -> None:
+        """If Follow Rig is on, translate the viewport camera by the same delta as the rig.
+
+        We move the camera by the *delta* (not snap to the rig) so the user's
+        chosen orbit angle and standoff distance are preserved frame-to-frame.
+        """
+        if not self._follow_rig or pose is None:
+            return
+        pose = self.data_loader.rebase_world_se3(pose)
+        position, _ = se3_to_position_wxyz(pose)
+        if self._last_rig_position is not None:
+            delta = position - self._last_rig_position
+            self.client.camera.position = np.asarray(self.client.camera.position) + delta
+        self._last_rig_position = position
 
     def _update_rig_frame_at_initial_pose(self) -> None:
         """Create the rig frame tripod at frame 0 so it is visible on load."""
