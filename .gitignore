@@ -13,5 +13,10 @@ _build/
 bazel-*
 .bazelrc.user
 
+# uv-managed virtualenv (uv also writes .venv/.gitignore; this is belt-and-suspenders)
+.venv/
+# Bazel is the source of truth for deps; uv.lock from `uv run` against the bare pyproject.toml is spurious
+uv.lock
+
 *.swp
 *.swo
