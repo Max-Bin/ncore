@@ -16,7 +16,7 @@ import logging
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Literal
+from typing import Dict, List, Literal, Optional
 
 import click
 import numpy as np
@@ -66,6 +66,11 @@ class T4Converter4Config(FileBasedDataConverterConfig):
     component_group_profile: Literal["default", "separate-sensors", "separate-all"] = "separate-sensors"
     store_sequence_meta: bool = True
     label_source: Literal["autolabel", "gt-annotation", "external"] = "autolabel"
+    # Optional directory of rebuilt LIDAR_CONCAT frames (NNNNN.bin, float32 x7:
+    # x,y,z,intensity,ring,return_type,time_sec) produced by decoding the raw
+    # pandar_packets. When set, the lidar component uses these real ring +
+    # per-point timestamps instead of the T4 .pcd.bin (which lacks both).
+    rebuilt_lidar_dir: Optional[str] = None
 
 
 class T4Converter4(FileBasedDataConverter):
@@ -83,6 +88,7 @@ class T4Converter4(FileBasedDataConverter):
         self.store_type = config.store_type
         self.store_sequence_meta = config.store_sequence_meta
         self.label_source = self._LABEL_SOURCE_MAP[config.label_source]
+        self.rebuilt_lidar_dir = Path(config.rebuilt_lidar_dir) if config.rebuilt_lidar_dir else None
         self.logger = logging.getLogger(__name__)
 
     @staticmethod
@@ -225,6 +231,15 @@ class T4Converter4(FileBasedDataConverter):
             timestamps_us=ego_timestamps_us,
         )
 
+        # T4 ``map`` is itself a metric global frame (e.g. UTM), so
+        # ``world -> world_global`` is identity. Downstream tools expect this
+        # transform to be present and to be stored in float64.
+        poses_writer.store_static_pose(
+            source_frame_id="world",
+            target_frame_id="world_global",
+            pose=np.eye(4, dtype=np.float64),
+        )
+
         for lidar_id in lidar_ids:
             self._convert_lidar(
                 lidar_id=lidar_id,
@@ -291,14 +306,33 @@ class T4Converter4(FileBasedDataConverter):
             pose=T_sensor_rig.astype(np.float32),
         )
 
-        for sd in tqdm.tqdm(sample_data, desc=f"lidar {lidar_id}"):
-            points = load_lidar_xyzi(sequence_path / sd["filename"])
-            xyz = points[:, :3]
-            intensity_raw = points[:, 3]
+        use_rebuilt = self.rebuilt_lidar_dir is not None and lidar_id == "LIDAR_CONCAT"
+        if use_rebuilt:
+            self.logger.info(f"Using rebuilt lidar (real ring + per-point time) from {self.rebuilt_lidar_dir}")
+
+        for frame_idx, sd in enumerate(tqdm.tqdm(sample_data, desc=f"lidar {lidar_id}")):
+            ts_us = np.uint64(sd["timestamp"])
+
+            if use_rebuilt:
+                rebuilt = self.rebuilt_lidar_dir / f"{frame_idx:05d}.bin"
+                if not rebuilt.exists():
+                    raise FileNotFoundError(f"Rebuilt lidar frame missing: {rebuilt}")
+                # x, y, z, intensity(0-255), ring, return_type, time_sec_offset
+                rec = np.fromfile(rebuilt, dtype=np.float32).reshape(-1, 7)
+                xyz = rec[:, :3]
+                intensity_raw = rec[:, 3]
+                ring = rec[:, 4]
+                point_time_sec = rec[:, 6]
+            else:
+                points = load_lidar_xyzi(sequence_path / sd["filename"])
+                xyz = points[:, :3]
+                intensity_raw = points[:, 3]
+                ring = None
+                point_time_sec = None
 
             distance_m = np.linalg.norm(xyz, axis=1).astype(np.float32)
-            direction = np.zeros_like(xyz, dtype=np.float32)
             valid = distance_m > 0
+            direction = np.zeros_like(xyz, dtype=np.float32)
             direction[valid] = (xyz[valid] / distance_m[valid, None]).astype(np.float32)
 
             # NCore requires unit-norm directions; drop zero-distance rays.
@@ -306,19 +340,37 @@ class T4Converter4(FileBasedDataConverter):
                 direction = direction[valid]
                 distance_m = distance_m[valid]
                 intensity_raw = intensity_raw[valid]
+                if ring is not None:
+                    ring = ring[valid]
+                    point_time_sec = point_time_sec[valid]
 
             intensity = np.clip(intensity_raw / T4_LIDAR_INTENSITY_MAX, 0.0, 1.0).astype(np.float32)
+            n_rays = direction.shape[0]
 
-            ts_us = np.uint64(sd["timestamp"])
-            point_timestamps_us = np.full(direction.shape[0], ts_us, dtype=np.uint64)
-
-            frame_start_us = ts_us
-            frame_end_us = ts_us + np.uint64(scan_period_us - 1)
+            if use_rebuilt:
+                # Real per-point timestamps: frame header (= earliest point) + per-point offset.
+                point_timestamps_us = (ts_us + (point_time_sec * 1e6).astype(np.uint64)).astype(np.uint64)
+                frame_start_us = ts_us
+                frame_end_us = point_timestamps_us.max() if n_rays else ts_us + np.uint64(scan_period_us - 1)
+                point_timestamps_us = np.clip(point_timestamps_us, frame_start_us, frame_end_us)
+                # The concatenated cloud fuses 6 physical lidars (1x128-line +
+                # 5x32-line) and has no single structured row/column grid, so we
+                # store it as an unstructured point cloud (model_element=None)
+                # rather than fabricating a grid. Real per-point time is kept.
+                model_element = None
+            else:
+                point_timestamps_us = np.full(n_rays, ts_us, dtype=np.uint64)
+                frame_start_us = ts_us
+                frame_end_us = ts_us + np.uint64(scan_period_us - 1)
+                ray_idx = np.arange(n_rays, dtype=np.int64)
+                model_element = np.column_stack(
+                    [(ray_idx % 128).astype(np.uint16), ((ray_idx // 128) % 3600).astype(np.uint16)]
+                )
 
             lidar_writer.store_frame(
                 direction=direction,
                 timestamp_us=point_timestamps_us,
-                model_element=None,
+                model_element=model_element,
                 distance_m=distance_m.reshape(1, -1),
                 intensity=intensity.reshape(1, -1),
                 frame_timestamps_us=np.array([frame_start_us, frame_end_us], dtype=np.uint64),
@@ -462,6 +514,13 @@ class T4Converter4(FileBasedDataConverter):
     default="autolabel",
     show_default=True,
     help="Provenance to record for cuboids in sample_annotation.json.",
+)
+@click.option(
+    "--rebuilt-lidar-dir",
+    type=str,
+    default=None,
+    help="Directory of rebuilt LIDAR_CONCAT frames (NNNNN.bin, float32 x7) with real "
+    "ring + per-point time, decoded from raw pandar_packets. Overrides the T4 .pcd.bin.",
 )
 @click.pass_context
 def t4_v4(ctx, *_, **kwargs):

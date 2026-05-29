@@ -37,12 +37,25 @@ sequences side-by-side.
 human-labeled ground truth depending on how the source dataset was produced.
 Set `--label-source` to match (`autolabel` is the default).
 
+### Real lidar ring + per-point time (optional)
+
+By default the lidar comes from the T4 `LIDAR_CONCAT/*.pcd.bin`, which only has
+`x, y, z, intensity` — no ring, no per-point time. To recover the real ones,
+decode the raw `pandar_packets` first (see [`lidar_rebuild/`](lidar_rebuild/))
+and pass the result:
+
+```bash
+... t4-v4 --rebuilt-lidar-dir <lidar_rebuild>/concatenated
+```
+
+The converter then stores real per-point timestamps; the fused multi-lidar
+cloud is stored as an unstructured point cloud (no synthetic row/col grid).
+
 ## Limitations
 
 - Camera frame intervals are stored as instantaneous (`[ts, ts]`); shutter
   readout duration is not represented.
-- Per-ray lidar timestamps default to the scan-start timestamp. To preserve
-  per-point times, the upstream rosbag2-to-T4 conversion must be configured to
-  include the `time_stamp` field in the point record (`num_lidar_feats: 7`).
+- Without `--rebuilt-lidar-dir`, per-ray lidar timestamps default to the
+  scan-start timestamp (the T4 `.pcd.bin` has no per-point time).
 - Cuboid annotations follow the nuScenes-style schema. Image-space annotations
   (`object_ann`, `surface_ann`) are not converted.
